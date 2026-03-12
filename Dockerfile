@@ -18,7 +18,9 @@ FROM alpine:3.19 AS zoekt
 RUN apk add --no-cache git ca-certificates bind-tools tini jansson wget
 
 COPY install-ctags-alpine.sh .
-RUN ./install-ctags-alpine.sh && rm install-ctags-alpine.sh
+RUN sed -i 's/\r$//' install-ctags-alpine.sh \
+ && /bin/sh install-ctags-alpine.sh \
+ && rm install-ctags-alpine.sh
 
 COPY --from=builder /go/bin/* /usr/local/bin/
 
