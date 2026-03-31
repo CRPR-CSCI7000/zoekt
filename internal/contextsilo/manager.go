@@ -217,6 +217,7 @@ func (m *Manager) ServeStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 var ErrInvalidRequest = errors.New("invalid ensure request")
+var ErrNoCommitAtOrBeforeAnchor = errors.New("no commit at or before anchor")
 
 func (m *Manager) Ensure(ctx context.Context, req ensureRequest) (*ensureResponse, error) {
 	owner := strings.TrimSpace(req.Owner)
@@ -668,6 +669,9 @@ func (m *Manager) buildManifest(
 		} else {
 			resolvedSHA, err := m.github.resolveRepoSHAAtOrBefore(ctx, owner, repoName, anchor)
 			if err != nil {
+				if errors.Is(err, ErrNoCommitAtOrBeforeAnchor) {
+					continue
+				}
 				return nil, fmt.Errorf("resolve sha for %s/%s at %s: %w", owner, repoName, anchor, err)
 			}
 			sha = resolvedSHA
@@ -1051,28 +1055,5 @@ func (c *githubClient) resolveRepoSHAAtOrBefore(ctx context.Context, owner strin
 			return sha, nil
 		}
 	}
-
-	repoURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
-	var repoPayload map[string]any
-	if err := c.doJSON(ctx, http.MethodGet, repoURL, nil, &repoPayload); err != nil {
-		return "", err
-	}
-	defaultBranch := strings.TrimSpace(asString(repoPayload["default_branch"]))
-	if defaultBranch == "" {
-		return "", fmt.Errorf("repository %s/%s missing default_branch", owner, repo)
-	}
-
-	fallbackURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits?sha=%s&per_page=1&page=1", owner, repo, defaultBranch)
-	commits = nil
-	if err := c.doJSON(ctx, http.MethodGet, fallbackURL, nil, &commits); err != nil {
-		return "", err
-	}
-	if len(commits) == 0 {
-		return "", fmt.Errorf("unable to resolve commit for %s/%s", owner, repo)
-	}
-	sha := strings.TrimSpace(asString(commits[0]["sha"]))
-	if sha == "" {
-		return "", fmt.Errorf("commit payload missing sha for %s/%s", owner, repo)
-	}
-	return sha, nil
+	return "", fmt.Errorf("%w for %s/%s at %s", ErrNoCommitAtOrBeforeAnchor, owner, repo, anchor)
 }

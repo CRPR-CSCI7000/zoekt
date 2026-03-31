@@ -1,8 +1,12 @@
 package contextsilo
 
 import (
+	"context"
+	"io"
 	"errors"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,4 +108,61 @@ func TestResolveReturnsDeterministicContextErrors(t *testing.T) {
 	if !errors.Is(err, zjson.ErrContextNotReady) {
 		t.Fatalf("expected ErrContextNotReady, got %v", err)
 	}
+}
+
+func TestResolveRepoSHAAtOrBeforeReturnsSHAWhenPresent(t *testing.T) {
+	client := &githubClient{
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host != "api.github.com" || req.URL.Path != "/repos/acme/checkout/commits" {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`[{"sha":"abc123"}]`)),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	sha, err := client.resolveRepoSHAAtOrBefore(context.Background(), "acme", "checkout", "2026-03-30T00:00:00Z")
+	if err != nil {
+		t.Fatalf("resolveRepoSHAAtOrBefore: %v", err)
+	}
+	if sha != "abc123" {
+		t.Fatalf("expected sha abc123, got %q", sha)
+	}
+}
+
+func TestResolveRepoSHAAtOrBeforeReturnsNoCommitAtAnchorError(t *testing.T) {
+	client := &githubClient{
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host != "api.github.com" || req.URL.Path != "/repos/acme/newrepo/commits" {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`[]`)),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := client.resolveRepoSHAAtOrBefore(context.Background(), "acme", "newrepo", "2026-03-30T00:00:00Z")
+	if !errors.Is(err, ErrNoCommitAtOrBeforeAnchor) {
+		t.Fatalf("expected ErrNoCommitAtOrBeforeAnchor, got %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
