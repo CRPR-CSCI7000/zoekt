@@ -1,15 +1,10 @@
 package json
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/grafana/regexp"
 	"github.com/sourcegraph/zoekt/query"
@@ -29,98 +24,6 @@ type ContextScope struct {
 
 type ContextScopeResolver interface {
 	Resolve(contextID string) (ContextScope, error)
-}
-
-type CatalogScopeResolver struct {
-	path string
-
-	mu         sync.Mutex
-	lastLoaded time.Time
-	lastErr    error
-	cache      map[string]catalogContext
-}
-
-type catalogPayload struct {
-	Contexts map[string]catalogContext `json:"contexts"`
-}
-
-type catalogContext struct {
-	Status    string   `json:"status"`
-	RepoIDs   []uint32 `json:"repo_ids"`
-	RepoNames []string `json:"repo_names"`
-}
-
-func NewCatalogScopeResolver(path string) *CatalogScopeResolver {
-	return &CatalogScopeResolver{
-		path: strings.TrimSpace(path),
-	}
-}
-
-func (r *CatalogScopeResolver) Resolve(contextID string) (ContextScope, error) {
-	if strings.TrimSpace(contextID) == "" {
-		return ContextScope{}, ErrMissingContextID
-	}
-
-	contexts, err := r.load()
-	if err != nil {
-		return ContextScope{}, err
-	}
-
-	entry, ok := contexts[contextID]
-	if !ok {
-		return ContextScope{}, fmt.Errorf("%w: %s", ErrUnknownContextID, contextID)
-	}
-	if !strings.EqualFold(strings.TrimSpace(entry.Status), "READY") {
-		return ContextScope{}, fmt.Errorf("%w: %s", ErrContextNotReady, contextID)
-	}
-
-	scope := normalizeScope(ContextScope{
-		RepoIDs:   append([]uint32(nil), entry.RepoIDs...),
-		RepoNames: append([]string(nil), entry.RepoNames...),
-	})
-	if len(scope.RepoIDs) == 0 && len(scope.RepoNames) == 0 {
-		return ContextScope{}, fmt.Errorf("%w: %s", ErrEmptyContext, contextID)
-	}
-	return scope, nil
-}
-
-func (r *CatalogScopeResolver) load() (map[string]catalogContext, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if strings.TrimSpace(r.path) == "" {
-		return nil, fmt.Errorf("context catalog path is empty")
-	}
-
-	fi, err := os.Stat(r.path)
-	if err != nil {
-		r.lastErr = err
-		return nil, fmt.Errorf("failed to stat context catalog %s: %w", r.path, err)
-	}
-
-	if r.cache != nil && !fi.ModTime().After(r.lastLoaded) {
-		return r.cache, nil
-	}
-
-	raw, err := os.ReadFile(r.path)
-	if err != nil {
-		r.lastErr = err
-		return nil, fmt.Errorf("failed to read context catalog %s: %w", r.path, err)
-	}
-
-	var payload catalogPayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		r.lastErr = err
-		return nil, fmt.Errorf("failed to parse context catalog %s: %w", r.path, err)
-	}
-	if payload.Contexts == nil {
-		payload.Contexts = map[string]catalogContext{}
-	}
-
-	r.cache = payload.Contexts
-	r.lastLoaded = fi.ModTime()
-	r.lastErr = nil
-	return r.cache, nil
 }
 
 func normalizeScope(scope ContextScope) ContextScope {
@@ -185,12 +88,4 @@ func ApplyScopeToQuery(base query.Q, scope ContextScope) (query.Q, error) {
 		}
 	}
 	return scoped, nil
-}
-
-func DefaultCatalogPath(root string) string {
-	base := strings.TrimSpace(root)
-	if base == "" {
-		return ""
-	}
-	return filepath.Join(base, "catalog", "context_catalog.json")
 }
