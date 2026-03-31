@@ -54,6 +54,7 @@ import (
 	"github.com/sourcegraph/zoekt/grpc/grpcutil"
 	webserverv1 "github.com/sourcegraph/zoekt/grpc/protos/zoekt/webserver/v1"
 	"github.com/sourcegraph/zoekt/index"
+	"github.com/sourcegraph/zoekt/internal/contextsilo"
 	"github.com/sourcegraph/zoekt/internal/debugserver"
 	"github.com/sourcegraph/zoekt/internal/profiler"
 	"github.com/sourcegraph/zoekt/internal/trace"
@@ -146,6 +147,10 @@ func main() {
 	templateDir := flag.String("template_dir", "", "set directory from which to load custom .html.tpl template files")
 	dumpTemplates := flag.Bool("dump_templates", false, "dump templates into --template_dir and exit.")
 	corsOrigin := flag.String("cors_origin", "", "allow requests from this origin. If empty, no CORS headers are set.")
+	requireContext := flag.Bool("require_context", false, "require context_id for scoped search/read endpoints")
+	contextCatalogPath := flag.String("context_catalog_path", "", "deprecated alias for context metadata path (unused)")
+	contextConfigPath := flag.String("context_config_path", "/data/config.json", "path to zoekt config JSON used for repo inclusion filters")
+	contextIdleTTL := flag.Duration("context_idle_ttl", 24*time.Hour, "idle TTL for PR context index silos before GC")
 	version := flag.Bool("version", false, "Print version number")
 
 	flag.Parse()
@@ -219,6 +224,19 @@ func main() {
 		Top:      web.Top,
 		Version:  index.Version,
 	}
+	var contextManager *contextsilo.Manager
+	if *requireContext {
+		if strings.TrimSpace(*contextCatalogPath) != "" {
+			log.Printf("context_catalog_path is deprecated and ignored in silo mode: %s", *contextCatalogPath)
+		}
+		contextManager, err = contextsilo.NewManager(*indexDir, *contextConfigPath, *contextIdleTTL)
+		if err != nil {
+			log.Fatal(err)
+		}
+		s.RequireContext = true
+		s.ContextScopeResolver = contextManager
+		s.ContextSearcherResolver = contextManager
+	}
 
 	if *templateDir != "" {
 		if err := loadTemplates(s.Top, *templateDir); err != nil {
@@ -248,6 +266,10 @@ func main() {
 	serveMux, err := web.NewMux(s)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if contextManager != nil {
+		serveMux.HandleFunc("/internal/context/ensure", contextManager.ServeEnsure)
+		serveMux.HandleFunc("/internal/context/status", contextManager.ServeStatus)
 	}
 
 	debugserver.AddHandlers(serveMux, *enablePprof)

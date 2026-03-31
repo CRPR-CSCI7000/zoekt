@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -90,6 +91,15 @@ type lineMatch struct {
 	Content string
 }
 
+type requestError struct {
+	statusCode int
+	message    string
+}
+
+func (e *requestError) Error() string {
+	return e.message
+}
+
 // AddLineNumbers adds line numbers to the beginning of each line in the given content string.
 // The line numbers are relative to the current line number (lineNum).
 // For 'before' content, numbers will count backwards from lineNum-1.
@@ -122,6 +132,10 @@ func AddLineNumbers(content string, lineNum int, isBefore bool) []lineMatch {
 
 const defaultNumResults = 50
 
+type ContextSearcherResolver interface {
+	Streamer(contextID string) (zoekt.Streamer, error)
+}
+
 type Server struct {
 	Searcher zoekt.Streamer
 
@@ -136,6 +150,15 @@ type Server struct {
 
 	// Version string for this server.
 	Version string
+
+	// Enforce context_id-based scoping on search/read APIs.
+	RequireContext bool
+
+	// Context resolver for context_id -> scoped repos.
+	ContextScopeResolver zjson.ContextScopeResolver
+
+	// Context searcher resolver for context_id -> context-specific index searcher.
+	ContextSearcherResolver ContextSearcherResolver
 
 	// Depending on the Host header, add a query to the entry
 	// page. For example, when serving on "search.myproject.org"
@@ -237,7 +260,20 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 		mux.HandleFunc("/print", s.servePrint)
 	}
 	if s.RPC {
-		mux.Handle("/api/", http.StripPrefix("/api", zjson.JSONServer(traceAwareSearcher{s.Searcher})))
+		mux.Handle(
+			"/api/",
+			http.StripPrefix(
+				"/api",
+				zjson.JSONServer(
+					traceAwareSearcher{s.Searcher},
+					zjson.ServerOptions{
+						RequireContext:          s.RequireContext,
+						ContextResolver:         s.ContextScopeResolver,
+						ContextSearcherResolver: s.ContextSearcherResolver,
+					},
+				),
+			),
+		)
 	}
 
 	mux.HandleFunc("/healthz", s.serveHealthz)
@@ -266,6 +302,11 @@ func (s *Server) serveHealthz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
 	result, err := s.serveSearchErr(r)
 	if err != nil {
+		var reqErr *requestError
+		if errors.As(err, &reqErr) {
+			http.Error(w, reqErr.Error(), reqErr.statusCode)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusTeapot)
 		return
 	}
@@ -302,6 +343,14 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 	}
 
 	q, err := query.Parse(queryStr)
+	if err != nil {
+		return nil, err
+	}
+	q, err = s.applyScopedContextQuery(r, q)
+	if err != nil {
+		return nil, err
+	}
+	activeSearcher, err := s.searcherForRequest(r)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +405,7 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 		return nil, err
 	}
 
-	result, err := s.Searcher.Search(ctx, q, &sOpts)
+	result, err := activeSearcher.Search(ctx, q, &sOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -390,6 +439,11 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 func (s *Server) servePrint(w http.ResponseWriter, r *http.Request) {
 	err := s.servePrintErr(w, r)
 	if err != nil {
+		var reqErr *requestError
+		if errors.As(err, &reqErr) {
+			http.Error(w, reqErr.Error(), reqErr.statusCode)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusTeapot)
 	}
 }
@@ -509,7 +563,11 @@ func (s *Server) serveRobots(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveListReposErr(q query.Q, qStr string, r *http.Request) (*RepoListInput, error) {
 	ctx := r.Context()
-	repos, err := s.Searcher.List(ctx, q, nil)
+	activeSearcher, err := s.searcherForRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	repos, err := activeSearcher.List(ctx, q, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -633,14 +691,22 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 		qs = append(qs, &query.Branch{Pattern: branchStr})
 	}
 
-	q := &query.And{Children: qs}
+	var q query.Q = &query.And{Children: qs}
+	q, err = s.applyScopedContextQuery(r, q)
+	if err != nil {
+		return err
+	}
+	activeSearcher, err := s.searcherForRequest(r)
+	if err != nil {
+		return err
+	}
 
 	sOpts := zoekt.SearchOptions{
 		Whole: true,
 	}
 
 	ctx := r.Context()
-	result, err := s.Searcher.Search(ctx, q, &sOpts)
+	result, err := activeSearcher.Search(ctx, q, &sOpts)
 	if err != nil {
 		return err
 	}
@@ -686,4 +752,88 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 
 	_, _ = w.Write(buf.Bytes())
 	return nil
+}
+
+func (s *Server) searcherForRequest(r *http.Request) (zoekt.Streamer, error) {
+	if !s.RequireContext {
+		return s.Searcher, nil
+	}
+	if s.ContextSearcherResolver == nil {
+		return nil, &requestError{
+			statusCode: http.StatusInternalServerError,
+			message:    "required context mode is enabled without searcher resolver",
+		}
+	}
+	contextID := strings.TrimSpace(r.URL.Query().Get("context_id"))
+	if contextID == "" {
+		return nil, &requestError{
+			statusCode: http.StatusBadRequest,
+			message:    zjson.ErrMissingContextID.Error(),
+		}
+	}
+	streamer, err := s.ContextSearcherResolver.Streamer(contextID)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, zjson.ErrMissingContextID),
+			errors.Is(err, zjson.ErrUnknownContextID),
+			errors.Is(err, zjson.ErrContextNotReady),
+			errors.Is(err, zjson.ErrEmptyContext):
+			statusCode = http.StatusBadRequest
+		}
+		return nil, &requestError{
+			statusCode: statusCode,
+			message:    err.Error(),
+		}
+	}
+	return streamer, nil
+}
+
+func (s *Server) applyScopedContextQuery(r *http.Request, base query.Q) (query.Q, error) {
+	if !s.RequireContext {
+		return base, nil
+	}
+
+	contextID := strings.TrimSpace(r.URL.Query().Get("context_id"))
+	if contextID == "" {
+		return nil, &requestError{
+			statusCode: http.StatusBadRequest,
+			message:    zjson.ErrMissingContextID.Error(),
+		}
+	}
+	if s.ContextScopeResolver == nil {
+		return nil, &requestError{
+			statusCode: http.StatusInternalServerError,
+			message:    "required context mode is enabled without resolver",
+		}
+	}
+
+	scope, err := s.ContextScopeResolver.Resolve(contextID)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, zjson.ErrMissingContextID),
+			errors.Is(err, zjson.ErrUnknownContextID),
+			errors.Is(err, zjson.ErrContextNotReady),
+			errors.Is(err, zjson.ErrEmptyContext):
+			statusCode = http.StatusBadRequest
+		}
+		return nil, &requestError{
+			statusCode: statusCode,
+			message:    err.Error(),
+		}
+	}
+
+	scopedQuery, err := zjson.ApplyScopeToQuery(base, scope)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		if errors.Is(err, zjson.ErrEmptyContext) {
+			statusCode = http.StatusBadRequest
+		}
+		return nil, &requestError{
+			statusCode: statusCode,
+			message:    err.Error(),
+		}
+	}
+	return scopedQuery, nil
 }

@@ -3,7 +3,10 @@ package json
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/sourcegraph/zoekt"
@@ -14,22 +17,42 @@ import (
 // take. This is the same default used by Sourcegraph.
 const defaultTimeout = 20 * time.Second
 
-func JSONServer(searcher zoekt.Searcher) http.Handler {
-	s := jsonSearcher{searcher}
+type ServerOptions struct {
+	RequireContext          bool
+	ContextResolver         ContextScopeResolver
+	ContextSearcherResolver ContextSearcherResolver
+}
+
+type ContextSearcherResolver interface {
+	Streamer(contextID string) (zoekt.Streamer, error)
+}
+
+func JSONServer(searcher zoekt.Searcher, opts ...ServerOptions) http.Handler {
+	var options ServerOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	s := jsonSearcher{
+		Searcher: searcher,
+		options:  options,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", s.jsonSearch)
 	mux.HandleFunc("/list", s.jsonList)
+	mux.HandleFunc("/list-all", s.jsonListAll)
 	return mux
 }
 
 type jsonSearcher struct {
 	Searcher zoekt.Searcher
+	options  ServerOptions
 }
 
 type jsonSearchArgs struct {
-	Q       string
-	RepoIDs *[]uint32
-	Opts    *zoekt.SearchOptions
+	Q         string
+	RepoIDs   *[]uint32
+	Opts      *zoekt.SearchOptions
+	ContextID string `json:"context_id"`
 }
 
 type jsonSearchReply struct {
@@ -37,12 +60,17 @@ type jsonSearchReply struct {
 }
 
 type jsonListArgs struct {
-	Q    string
-	Opts *zoekt.ListOptions
+	Q         string
+	Opts      *zoekt.ListOptions
+	ContextID string `json:"context_id"`
 }
 
 type jsonListReply struct {
 	List *zoekt.RepoList
+}
+
+type jsonListAllArgs struct {
+	ContextID string `json:"context_id"`
 }
 
 func (s *jsonSearcher) jsonSearch(w http.ResponseWriter, req *http.Request) {
@@ -78,6 +106,20 @@ func (s *jsonSearcher) jsonSearch(w http.ResponseWriter, req *http.Request) {
 		q = query.NewAnd(q, query.NewRepoIDs(*searchArgs.RepoIDs...))
 	}
 
+	if s.options.RequireContext {
+		scopedQuery, statusCode, err := s.applyRequiredContext(q, searchArgs.ContextID)
+		if err != nil {
+			jsonError(w, statusCode, err.Error())
+			return
+		}
+		q = scopedQuery
+	}
+	activeSearcher, statusCode, err := s.searcherForContext(searchArgs.ContextID)
+	if err != nil {
+		jsonError(w, statusCode, err.Error())
+		return
+	}
+
 	// Set a timeout if the user hasn't specified one.
 	if searchArgs.Opts.MaxWallTime == 0 {
 		var cancel context.CancelFunc
@@ -85,12 +127,12 @@ func (s *jsonSearcher) jsonSearch(w http.ResponseWriter, req *http.Request) {
 		defer cancel()
 	}
 
-	if err := CalculateDefaultSearchLimits(ctx, q, s.Searcher, searchArgs.Opts); err != nil {
+	if err := CalculateDefaultSearchLimits(ctx, q, activeSearcher, searchArgs.Opts); err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	searchResult, err := s.Searcher.Search(ctx, q, searchArgs.Opts)
+	searchResult, err := activeSearcher.Search(ctx, q, searchArgs.Opts)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -166,7 +208,21 @@ func (s *jsonSearcher) jsonList(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	listResult, err := s.Searcher.List(req.Context(), query, listArgs.Opts)
+	if s.options.RequireContext {
+		scopedQuery, statusCode, err := s.applyRequiredContext(query, listArgs.ContextID)
+		if err != nil {
+			jsonError(w, statusCode, err.Error())
+			return
+		}
+		query = scopedQuery
+	}
+	activeSearcher, statusCode, err := s.searcherForContext(listArgs.ContextID)
+	if err != nil {
+		jsonError(w, statusCode, err.Error())
+		return
+	}
+
+	listResult, err := activeSearcher.List(req.Context(), query, listArgs.Opts)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -177,4 +233,109 @@ func (s *jsonSearcher) jsonList(w http.ResponseWriter, req *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+}
+
+func (s *jsonSearcher) jsonListAll(w http.ResponseWriter, req *http.Request) {
+	w.Header().Add("Content-Type", "application/json")
+
+	if req.Method != "POST" {
+		jsonError(w, http.StatusMethodNotAllowed, "Only POST is supported")
+		return
+	}
+
+	listAllArgs := jsonListAllArgs{}
+	if err := json.NewDecoder(req.Body).Decode(&listAllArgs); err != nil && err != io.EOF {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	activeSearcher := zoekt.Searcher(s.Searcher)
+	if contextID := strings.TrimSpace(listAllArgs.ContextID); contextID != "" {
+		if s.options.ContextSearcherResolver == nil {
+			jsonError(w, http.StatusInternalServerError, "required context mode is enabled without searcher resolver")
+			return
+		}
+		streamer, err := s.options.ContextSearcherResolver.Streamer(contextID)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrMissingContextID),
+				errors.Is(err, ErrUnknownContextID),
+				errors.Is(err, ErrContextNotReady),
+				errors.Is(err, ErrEmptyContext):
+				jsonError(w, http.StatusBadRequest, err.Error())
+			default:
+				jsonError(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		activeSearcher = streamer
+	}
+
+	listResult, err := activeSearcher.List(req.Context(), &query.Const{Value: true}, nil)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(jsonListReply{List: listResult}); err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+}
+
+func (s *jsonSearcher) searcherForContext(contextIDRaw string) (zoekt.Searcher, int, error) {
+	if !s.options.RequireContext {
+		return s.Searcher, http.StatusOK, nil
+	}
+	contextID := strings.TrimSpace(contextIDRaw)
+	if contextID == "" {
+		return nil, http.StatusBadRequest, ErrMissingContextID
+	}
+	if s.options.ContextSearcherResolver == nil {
+		return nil, http.StatusInternalServerError, errors.New("required context mode is enabled without searcher resolver")
+	}
+	streamer, err := s.options.ContextSearcherResolver.Streamer(contextID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrMissingContextID),
+			errors.Is(err, ErrUnknownContextID),
+			errors.Is(err, ErrContextNotReady),
+			errors.Is(err, ErrEmptyContext):
+			return nil, http.StatusBadRequest, err
+		default:
+			return nil, http.StatusInternalServerError, err
+		}
+	}
+	return streamer, http.StatusOK, nil
+}
+
+func (s *jsonSearcher) applyRequiredContext(base query.Q, contextIDRaw string) (query.Q, int, error) {
+	contextID := strings.TrimSpace(contextIDRaw)
+	if contextID == "" {
+		return nil, http.StatusBadRequest, ErrMissingContextID
+	}
+	if s.options.ContextResolver == nil {
+		return nil, http.StatusInternalServerError, errors.New("required context mode is enabled without resolver")
+	}
+
+	scope, err := s.options.ContextResolver.Resolve(contextID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrMissingContextID):
+			return nil, http.StatusBadRequest, err
+		case errors.Is(err, ErrUnknownContextID), errors.Is(err, ErrContextNotReady), errors.Is(err, ErrEmptyContext):
+			return nil, http.StatusBadRequest, err
+		default:
+			return nil, http.StatusInternalServerError, err
+		}
+	}
+
+	scopedQuery, err := ApplyScopeToQuery(base, scope)
+	if err != nil {
+		if errors.Is(err, ErrEmptyContext) {
+			return nil, http.StatusBadRequest, err
+		}
+		return nil, http.StatusInternalServerError, err
+	}
+	return scopedQuery, http.StatusOK, nil
 }
