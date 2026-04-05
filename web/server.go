@@ -711,7 +711,13 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	if len(result.Files) != 1 {
+	if len(result.Files) == 0 {
+		return &requestError{
+			statusCode: http.StatusNotFound,
+			message:    fmt.Sprintf("file not found: r=%s f=%s", repoStr, fileStr),
+		}
+	}
+	if len(result.Files) > 1 {
 		var ss []string
 		for _, n := range result.Files {
 			ss = append(ss, n.FileName)

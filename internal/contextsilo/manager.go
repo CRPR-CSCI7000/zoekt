@@ -464,7 +464,8 @@ func (m *Manager) buildContext(
 		}
 	}
 
-	if err := verifyManifestReady(ctx, indexDir, manifest.Repos); err != nil {
+	verifiedSearcher, err := verifyManifestReady(ctx, indexDir, manifest.Repos)
+	if err != nil {
 		status.Status = statusFailed
 		status.Error = err.Error()
 		status.UpdatedAt = nowISO()
@@ -478,30 +479,31 @@ func (m *Manager) buildContext(
 	status.UpdatedAt = nowISO()
 	status.LastAccessedAt = status.UpdatedAt
 	if err := writeJSONAtomic(statusPath, status); err != nil {
+		verifiedSearcher.Close()
 		return nil, err
 	}
 
 	m.mu.Lock()
 	if stale, ok := m.searchers[contextID]; ok {
 		stale.Close()
-		delete(m.searchers, contextID)
 	}
+	m.searchers[contextID] = verifiedSearcher
 	m.mu.Unlock()
 
 	return status, nil
 }
 
-func verifyManifestReady(ctx context.Context, indexDir string, manifestRepos []manifestRepo) error {
+func verifyManifestReady(ctx context.Context, indexDir string, manifestRepos []manifestRepo) (zoekt.Streamer, error) {
 	streamer, err := search.NewDirectorySearcherFast(indexDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer streamer.Close()
 
 	for {
 		list, err := streamer.List(ctx, &query.Const{Value: true}, nil)
 		if err != nil {
-			return err
+			streamer.Close()
+			return nil, err
 		}
 
 		// Searcher startup is asynchronous. Wait until shard load settles before
@@ -510,7 +512,8 @@ func verifyManifestReady(ctx context.Context, indexDir string, manifestRepos []m
 		if list.Crashes > 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				streamer.Close()
+				return nil, ctx.Err()
 			case <-time.After(250 * time.Millisecond):
 				continue
 			}
@@ -530,14 +533,16 @@ func verifyManifestReady(ctx context.Context, indexDir string, manifestRepos []m
 			expected := strings.ToLower(strings.TrimSpace(repo.SHA))
 			got, ok := inventory[name]
 			if !ok {
-				return fmt.Errorf("context index missing repository %s", repo.RepoName)
+				streamer.Close()
+				return nil, fmt.Errorf("context index missing repository %s", repo.RepoName)
 			}
 			got = strings.ToLower(strings.TrimSpace(got))
 			if expected != "" && got != "" && expected != got {
-				return fmt.Errorf("indexed SHA mismatch for %s: expected=%s got=%s", repo.RepoName, expected, got)
+				streamer.Close()
+				return nil, fmt.Errorf("indexed SHA mismatch for %s: expected=%s got=%s", repo.RepoName, expected, got)
 			}
 		}
-		return nil
+		return streamer, nil
 	}
 }
 
