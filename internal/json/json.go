@@ -202,19 +202,19 @@ func (s *jsonSearcher) jsonList(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	query, err := query.Parse(listArgs.Q)
+	parsedQuery, err := query.Parse(listArgs.Q)
 	if err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if s.options.RequireContext {
-		scopedQuery, statusCode, err := s.applyRequiredContext(query, listArgs.ContextID)
+		scopedQuery, statusCode, err := s.applyRequiredContext(parsedQuery, listArgs.ContextID)
 		if err != nil {
 			jsonError(w, statusCode, err.Error())
 			return
 		}
-		query = scopedQuery
+		parsedQuery = scopedQuery
 	}
 	activeSearcher, statusCode, err := s.searcherForContext(listArgs.ContextID)
 	if err != nil {
@@ -222,7 +222,12 @@ func (s *jsonSearcher) jsonList(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	listResult, err := activeSearcher.List(req.Context(), query, listArgs.Opts)
+	listResult, err := activeSearcher.List(req.Context(), parsedQuery, listArgs.Opts)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	listResult, err = warmContextListResult(req.Context(), activeSearcher, parsedQuery, listArgs.Opts, listArgs.ContextID, listResult)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -281,6 +286,46 @@ func (s *jsonSearcher) jsonListAll(w http.ResponseWriter, req *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+}
+
+func warmContextListResult(
+	ctx context.Context,
+	searcher zoekt.Searcher,
+	q query.Q,
+	opts *zoekt.ListOptions,
+	contextID string,
+	initial *zoekt.RepoList,
+) (*zoekt.RepoList, error) {
+	if strings.TrimSpace(contextID) == "" {
+		return initial, nil
+	}
+	if initial == nil {
+		return initial, nil
+	}
+	if len(initial.Repos) > 0 || len(initial.ReposMap) > 0 {
+		return initial, nil
+	}
+
+	const retries = 6
+	const delay = 150 * time.Millisecond
+	current := initial
+	for attempt := 0; attempt < retries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		next, err := searcher.List(ctx, q, opts)
+		if err != nil {
+			return nil, err
+		}
+		current = next
+		if current != nil && (len(current.Repos) > 0 || len(current.ReposMap) > 0) {
+			return current, nil
+		}
+	}
+	return current, nil
 }
 
 func (s *jsonSearcher) searcherForContext(contextIDRaw string) (zoekt.Searcher, int, error) {
