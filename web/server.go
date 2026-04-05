@@ -677,7 +677,7 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	repoRe, err := regexp.Compile("^" + regexp.QuoteMeta(repoStr) + "$")
+	repoRe, err := regexp.Compile("(?i)^" + regexp.QuoteMeta(repoStr) + "$")
 	if err != nil {
 		return err
 	}

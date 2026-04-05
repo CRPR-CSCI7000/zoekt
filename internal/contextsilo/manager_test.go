@@ -2,9 +2,10 @@ package contextsilo
 
 import (
 	"context"
-	"io"
 	"errors"
+	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,6 +108,34 @@ func TestResolveReturnsDeterministicContextErrors(t *testing.T) {
 	_, err = manager.Resolve(contextID)
 	if !errors.Is(err, zjson.ErrContextNotReady) {
 		t.Fatalf("expected ErrContextNotReady, got %v", err)
+	}
+}
+
+func TestLoadNameFiltersTreatsPatternsAsCaseInsensitive(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "context_filters.json")
+	config := `[{"GithubOrg":"acme","Name":".*_TEST.*"}]`
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(tmp, configPath, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	filters, err := manager.loadNameFilters("acme")
+	if err != nil {
+		t.Fatalf("loadNameFilters: %v", err)
+	}
+	if len(filters) != 1 {
+		t.Fatalf("expected one filter, got %d", len(filters))
+	}
+	if !matchesFilters(filters, "pantry_pal_ui_test") {
+		t.Fatalf("expected lowercase repo name to match case-insensitive filter")
+	}
+	if !matchesFilters(filters, "PANTRY_PAL_API_TEST") {
+		t.Fatalf("expected uppercase repo name to match case-insensitive filter")
 	}
 }
 

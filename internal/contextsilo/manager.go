@@ -29,9 +29,10 @@ import (
 )
 
 const (
-	statusBuilding = "BUILDING"
-	statusReady    = "READY"
-	statusFailed   = "FAILED"
+	statusBuilding   = "BUILDING"
+	statusReady      = "READY"
+	statusFailed     = "FAILED"
+	contextIDVersion = "v2"
 )
 
 type ensureRequest struct {
@@ -150,7 +151,8 @@ func NewManager(indexRoot string, configPath string, idleTTL time.Duration) (*Ma
 
 func BuildContextID(owner string, repo string, prNumber int, anchorCreatedAt string, headSHA string) string {
 	identity := fmt.Sprintf(
-		"%s/%s/%d@%s#%s",
+		"%s|%s/%s/%d@%s#%s",
+		contextIDVersion,
 		strings.ToLower(strings.TrimSpace(owner)),
 		strings.ToLower(strings.TrimSpace(repo)),
 		prNumber,
@@ -572,6 +574,14 @@ func (m *Manager) indexRepoAtAnchor(ctx context.Context, reposDir string, indexD
 	}
 
 	repoPath := filepath.Join(reposDir, filepath.FromSlash(repoName)+".git")
+	webURL := fmt.Sprintf("https://github.com/%s/%s", owner, repo)
+	if err := runCmd(ctx, "git", "-C", repoPath, "config", "zoekt.web-url", webURL); err != nil {
+		return fmt.Errorf("set zoekt.web-url for %s: %w", repoName, err)
+	}
+	if err := runCmd(ctx, "git", "-C", repoPath, "config", "zoekt.web-url-type", "github"); err != nil {
+		return fmt.Errorf("set zoekt.web-url-type for %s: %w", repoName, err)
+	}
+
 	if err := runCmd(ctx, "git", "-C", repoPath, "fetch", "--quiet", "origin", sha); err != nil {
 		return fmt.Errorf("fetch anchored sha %s for %s: %w", sha, repoName, err)
 	}
@@ -730,11 +740,11 @@ func (m *Manager) loadNameFilters(owner string) ([]compiledFilter, error) {
 		if name == "" {
 			continue
 		}
-		re, err := regexp.Compile(name)
+		ciRe, err := regexp.Compile("(?i)" + name)
 		if err != nil {
 			continue
 		}
-		filters = append(filters, compiledFilter{org: cfgOwner, pattern: re})
+		filters = append(filters, compiledFilter{org: cfgOwner, pattern: ciRe})
 	}
 	return filters, nil
 }

@@ -69,9 +69,6 @@ func ApplyScopeToQuery(base query.Q, scope ContextScope) (query.Q, error) {
 	}
 
 	scoped := base
-	if len(normalized.RepoIDs) > 0 {
-		scoped = query.NewAnd(scoped, query.NewRepoIDs(normalized.RepoIDs...))
-	}
 	if len(normalized.RepoNames) > 0 {
 		nameQueries := make([]query.Q, 0, len(normalized.RepoNames))
 		for _, repoName := range normalized.RepoNames {
@@ -86,6 +83,11 @@ func ApplyScopeToQuery(base query.Q, scope ContextScope) (query.Q, error) {
 		} else {
 			scoped = query.NewAnd(scoped, &query.Or{Children: nameQueries})
 		}
+		return scoped, nil
+	}
+
+	if len(normalized.RepoIDs) > 0 {
+		scoped = query.NewAnd(scoped, query.NewRepoIDs(normalized.RepoIDs...))
 	}
 	return scoped, nil
 }

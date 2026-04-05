@@ -202,6 +202,48 @@ func TestPrint(t *testing.T) {
 	}
 }
 
+func TestPrintRepoMatchIsCaseInsensitive(t *testing.T) {
+	b, err := index.NewShardBuilder(&zoekt.Repository{
+		Name:     "github.com/acme/checkout",
+		URL:      "repo-url",
+		Branches: []zoekt.RepositoryBranch{{Name: "master", Version: "1234"}},
+	})
+	if err != nil {
+		t.Fatalf("NewShardBuilder: %v", err)
+	}
+	if err := b.Add(index.Document{
+		Name:     "routes/pantry_routes.py",
+		Content:  []byte("def get_items():\n    return []\n"),
+		Branches: []string{"master"},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	s := searcherForTest(t, b)
+	srv := Server{
+		Searcher: s,
+		Top:      Top,
+		HTML:     true,
+		Print:    true,
+	}
+
+	mux, err := NewMux(&srv)
+	if err != nil {
+		t.Fatalf("NewMux: %v", err)
+	}
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	for req, needles := range map[string][]string{
+		"/print?q=items&r=GITHUB.COM/ACME/CHECKOUT&f=routes/pantry_routes.py": {
+			`pre id="l1" class="inline-pre"><span class="noselect"><a href="#l1">`,
+		},
+	} {
+		checkNeedles(t, ts, req, needles)
+	}
+}
+
 func TestPrintDefault(t *testing.T) {
 	b, err := index.NewShardBuilder(&zoekt.Repository{
 		Name:     "name",
