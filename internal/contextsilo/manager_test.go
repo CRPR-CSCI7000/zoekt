@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sourcegraph/zoekt"
 	zjson "github.com/sourcegraph/zoekt/internal/json"
 )
 
@@ -108,6 +109,103 @@ func TestResolveReturnsDeterministicContextErrors(t *testing.T) {
 	_, err = manager.Resolve(contextID)
 	if !errors.Is(err, zjson.ErrContextNotReady) {
 		t.Fatalf("expected ErrContextNotReady, got %v", err)
+	}
+}
+
+func TestStreamerValidatesReadyIndexAgainstManifest(t *testing.T) {
+	tmp := t.TempDir()
+	manager, err := NewManager(tmp, "", 24*time.Hour)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	contextID := "ctx_ready_but_empty_index"
+	contextDir := filepath.Join(tmp, "contexts", contextID)
+	manifestPath := filepath.Join(contextDir, "manifest.json")
+	indexDir := filepath.Join(contextDir, "index")
+
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+
+	manifest := contextManifest{
+		ContextID: contextID,
+		Repos: []manifestRepo{
+			{RepoName: "github.com/acme/checkout", SHA: "abc123"},
+		},
+		GeneratedAt: nowISO(),
+	}
+	if err := writeJSONAtomic(manifestPath, manifest); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	status := contextStatus{
+		ContextID:      contextID,
+		Status:         statusReady,
+		ManifestPath:   manifestPath,
+		IndexDir:       indexDir,
+		CreatedAt:      nowISO(),
+		UpdatedAt:      nowISO(),
+		LastAccessedAt: nowISO(),
+	}
+	if err := writeJSONAtomic(filepath.Join(contextDir, "status.json"), status); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+
+	_, err = manager.Streamer(contextID)
+	if err == nil {
+		t.Fatalf("expected Streamer to fail when READY index misses manifest repos")
+	}
+	if !strings.Contains(err.Error(), "missing repository") {
+		t.Fatalf("expected missing repository error, got %v", err)
+	}
+}
+
+func TestManifestIsIndexedReturnsMissingRepoError(t *testing.T) {
+	list := &zoekt.RepoList{}
+	err := manifestIsIndexed(list, []manifestRepo{{RepoName: "github.com/acme/checkout", SHA: "abc123"}})
+	if err == nil {
+		t.Fatalf("expected error for missing manifest repo")
+	}
+	if !strings.Contains(err.Error(), "missing repository") {
+		t.Fatalf("expected missing repository error, got %v", err)
+	}
+}
+
+func TestManifestIsIndexedReturnsSHAMismatchError(t *testing.T) {
+	list := &zoekt.RepoList{
+		Repos: []*zoekt.RepoListEntry{
+			{
+				Repository: zoekt.Repository{
+					Name:     "github.com/acme/checkout",
+					Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: "def456"}},
+				},
+			},
+		},
+	}
+	err := manifestIsIndexed(list, []manifestRepo{{RepoName: "github.com/acme/checkout", SHA: "abc123"}})
+	if err == nil {
+		t.Fatalf("expected error for mismatched sha")
+	}
+	if !strings.Contains(err.Error(), "indexed SHA mismatch") {
+		t.Fatalf("expected sha mismatch error, got %v", err)
+	}
+}
+
+func TestManifestIsIndexedAcceptsMatchingRepoAndSHA(t *testing.T) {
+	list := &zoekt.RepoList{
+		Repos: []*zoekt.RepoListEntry{
+			{
+				Repository: zoekt.Repository{
+					Name:     "github.com/acme/checkout",
+					Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: "abc123"}},
+				},
+			},
+		},
+	}
+	err := manifestIsIndexed(list, []manifestRepo{{RepoName: "github.com/acme/checkout", SHA: "abc123"}})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 }
 

@@ -718,11 +718,27 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	if len(result.Files) > 1 {
-		var ss []string
-		for _, n := range result.Files {
-			ss = append(ss, n.FileName)
+		matchedRepo := strings.TrimSpace(repoStr)
+		matchedFile := strings.TrimSpace(fileStr)
+		var narrowed []zoekt.FileMatch
+		for _, candidate := range result.Files {
+			if strings.EqualFold(strings.TrimSpace(candidate.Repository), matchedRepo) && strings.TrimSpace(candidate.FileName) == matchedFile {
+				narrowed = append(narrowed, candidate)
+			}
 		}
-		return fmt.Errorf("ambiguous result: %v", ss)
+		if len(narrowed) == 1 {
+			result.Files = narrowed
+		} else {
+			var ss []string
+			for _, n := range result.Files {
+				label := strings.TrimSpace(n.FileName)
+				if repoName := strings.TrimSpace(n.Repository); repoName != "" {
+					label = fmt.Sprintf("%s@%s", label, repoName)
+				}
+				ss = append(ss, label)
+			}
+			return fmt.Errorf("ambiguous result: %v", ss)
+		}
 	}
 
 	f := result.Files[0]

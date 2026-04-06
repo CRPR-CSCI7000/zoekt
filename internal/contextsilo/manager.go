@@ -258,10 +258,14 @@ func (m *Manager) Ensure(ctx context.Context, req ensureRequest) (*ensureRespons
 	statusPath := m.statusPath(contextID)
 	status, err := readStatusFile(statusPath)
 	if err == nil && strings.EqualFold(status.Status, statusReady) {
-		if err := m.touch(status); err != nil {
-			return nil, err
+		if err := m.refreshReadySearcher(ctx, contextID, status); err != nil {
+			status = nil
+		} else {
+			if err := m.touch(status); err != nil {
+				return nil, err
+			}
+			return m.toEnsureResponse(status), nil
 		}
-		return m.toEnsureResponse(status), nil
 	}
 
 	status, err = m.buildContext(
@@ -348,18 +352,77 @@ func (m *Manager) Streamer(contextID string) (zoekt.Streamer, error) {
 	}
 
 	_ = m.touch(status)
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if streamer, ok := m.searchers[contextID]; ok {
-		return streamer, nil
-	}
-	streamer, err := search.NewDirectorySearcherFast(status.IndexDir)
+	manifest, err := readManifest(status.ManifestPath)
 	if err != nil {
 		return nil, err
 	}
+
+	lock := m.contextLock(contextID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	m.mu.Lock()
+	if streamer, ok := m.searchers[contextID]; ok {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		list, listErr := streamer.List(probeCtx, &query.Const{Value: true}, nil)
+		cancel()
+		if listErr == nil && list != nil && list.Crashes == 0 && manifestIsIndexed(list, manifest.Repos) == nil {
+			m.mu.Unlock()
+			return streamer, nil
+		}
+		streamer.Close()
+		delete(m.searchers, contextID)
+	}
+	m.mu.Unlock()
+
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	streamer, err := verifyManifestReady(verifyCtx, status.IndexDir, manifest.Repos)
+	if err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	if stale, ok := m.searchers[contextID]; ok {
+		stale.Close()
+	}
 	m.searchers[contextID] = streamer
+	m.mu.Unlock()
+
 	return streamer, nil
+}
+
+func (m *Manager) refreshReadySearcher(ctx context.Context, contextID string, status *contextStatus) error {
+	if status == nil {
+		return fmt.Errorf("missing context status")
+	}
+
+	manifest, err := readManifest(status.ManifestPath)
+	if err != nil {
+		return err
+	}
+
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	streamer, err := verifyManifestReady(verifyCtx, status.IndexDir, manifest.Repos)
+	if err != nil {
+		m.mu.Lock()
+		if stale, ok := m.searchers[contextID]; ok {
+			stale.Close()
+			delete(m.searchers, contextID)
+		}
+		m.mu.Unlock()
+		return err
+	}
+
+	m.mu.Lock()
+	if stale, ok := m.searchers[contextID]; ok {
+		stale.Close()
+	}
+	m.searchers[contextID] = streamer
+	m.mu.Unlock()
+
+	return nil
 }
 
 func (m *Manager) buildContext(
@@ -478,17 +541,22 @@ func (m *Manager) buildContext(
 	status.Error = ""
 	status.UpdatedAt = nowISO()
 	status.LastAccessedAt = status.UpdatedAt
-	if err := writeJSONAtomic(statusPath, status); err != nil {
-		verifiedSearcher.Close()
-		return nil, err
-	}
-
 	m.mu.Lock()
 	if stale, ok := m.searchers[contextID]; ok {
 		stale.Close()
 	}
 	m.searchers[contextID] = verifiedSearcher
 	m.mu.Unlock()
+
+	if err := writeJSONAtomic(statusPath, status); err != nil {
+		m.mu.Lock()
+		if current, ok := m.searchers[contextID]; ok && current == verifiedSearcher {
+			delete(m.searchers, contextID)
+		}
+		m.mu.Unlock()
+		verifiedSearcher.Close()
+		return nil, err
+	}
 
 	return status, nil
 }
@@ -519,31 +587,38 @@ func verifyManifestReady(ctx context.Context, indexDir string, manifestRepos []m
 			}
 		}
 
-		inventory := map[string]string{}
-		for _, repoEntry := range list.Repos {
-			name := strings.ToLower(strings.TrimSpace(repoEntry.Repository.Name))
-			if name == "" {
-				continue
-			}
-			inventory[name] = extractHeadSHA(repoEntry.Repository.Branches)
-		}
-
-		for _, repo := range manifestRepos {
-			name := strings.ToLower(strings.TrimSpace(repo.RepoName))
-			expected := strings.ToLower(strings.TrimSpace(repo.SHA))
-			got, ok := inventory[name]
-			if !ok {
-				streamer.Close()
-				return nil, fmt.Errorf("context index missing repository %s", repo.RepoName)
-			}
-			got = strings.ToLower(strings.TrimSpace(got))
-			if expected != "" && got != "" && expected != got {
-				streamer.Close()
-				return nil, fmt.Errorf("indexed SHA mismatch for %s: expected=%s got=%s", repo.RepoName, expected, got)
-			}
+		if err := manifestIsIndexed(list, manifestRepos); err != nil {
+			streamer.Close()
+			return nil, err
 		}
 		return streamer, nil
 	}
+}
+
+func manifestIsIndexed(list *zoekt.RepoList, manifestRepos []manifestRepo) error {
+	inventory := map[string]string{}
+	for _, repoEntry := range list.Repos {
+		name := strings.ToLower(strings.TrimSpace(repoEntry.Repository.Name))
+		if name == "" {
+			continue
+		}
+		inventory[name] = extractHeadSHA(repoEntry.Repository.Branches)
+	}
+
+	for _, repo := range manifestRepos {
+		name := strings.ToLower(strings.TrimSpace(repo.RepoName))
+		expected := strings.ToLower(strings.TrimSpace(repo.SHA))
+		got, ok := inventory[name]
+		if !ok {
+			return fmt.Errorf("context index missing repository %s", repo.RepoName)
+		}
+		got = strings.ToLower(strings.TrimSpace(got))
+		if expected != "" && got != "" && expected != got {
+			return fmt.Errorf("indexed SHA mismatch for %s: expected=%s got=%s", repo.RepoName, expected, got)
+		}
+	}
+
+	return nil
 }
 
 func extractHeadSHA(branches []zoekt.RepositoryBranch) string {
